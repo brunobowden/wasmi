@@ -315,4 +315,40 @@ mod test {
         assert_eq!(buffer.len(), 1);
         assert_eq!(buffer.data().first(), Some(&0x00_u8));
     }
+
+    #[test]
+    fn grow_from_empty() {
+        let mut buffer = ByteBuffer::new(0).unwrap();
+        buffer.grow(0).unwrap();
+        assert_eq!(buffer.len(), 0);
+        buffer.grow(1).unwrap();
+        assert_eq!(buffer.data(), &[0x00_u8]);
+    }
+
+    #[test]
+    fn grow_matches_vec_model() {
+        // Checks the contents after each growth step against a plain `Vec<u8>`.
+        //
+        // The step sizes cover growing by nothing, by a single byte and by large
+        // amounts, so that both growing within and beyond the current capacity
+        // are exercised regardless of the buffer's allocation strategy.
+        let mut buffer = ByteBuffer::new(3).unwrap();
+        let mut model = alloc::vec![0x00_u8; 3];
+        for (step, new_size) in [3, 4, 7, 8, 9, 31, 32, 33, 1000].into_iter().enumerate() {
+            buffer.grow(new_size).unwrap();
+            model.resize(new_size, 0x00_u8);
+            assert_eq!(
+                buffer.data(),
+                &model[..],
+                "mismatch after growing to {new_size}"
+            );
+            // Write the first and last byte so that later growth steps must preserve them.
+            let marker = step as u8 + 1;
+            buffer.data_mut()[0] = marker;
+            buffer.data_mut()[new_size - 1] = marker;
+            model[0] = marker;
+            model[new_size - 1] = marker;
+        }
+        assert_eq!(buffer.data(), &model[..]);
+    }
 }
