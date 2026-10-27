@@ -79,6 +79,31 @@ fn vec_into_raw_parts(vec: Vec<u8>) -> (*mut u8, usize, usize) {
     (vec.as_mut_ptr(), vec.len(), vec.capacity())
 }
 
+/// Copies `src` into the zero-initialized `dst`, skipping chunks of `src` that are all zero.
+///
+/// # Note
+///
+/// Writing a zero chunk into the zeroed `dst` would not change its contents but would
+/// commit its pages. Skipping zero chunks keeps the pages of `dst` uncommitted that
+/// correspond to pages of `src` which were never written. Reading never-written pages
+/// of `src` does not commit them on systems that map such reads to a shared zero page.
+///
+/// # Panics (Debug)
+///
+/// If `src` and `dst` have different lengths.
+fn copy_nonzero_chunks(src: &[u8], dst: &mut [u8]) {
+    /// The chunk size; the smallest page size in common use. With larger pages (e.g. 16 KiB
+    /// on macOS/arm64) a non-zero chunk commits the whole page that contains it.
+    const CHUNK_SIZE: usize = 4096;
+    static ZEROS: [u8; CHUNK_SIZE] = [0x00_u8; CHUNK_SIZE];
+    debug_assert_eq!(src.len(), dst.len());
+    for (src, dst) in src.chunks(CHUNK_SIZE).zip(dst.chunks_mut(CHUNK_SIZE)) {
+        if src != &ZEROS[..src.len()] {
+            dst.copy_from_slice(src);
+        }
+    }
+}
+
 impl ByteBuffer {
     /// Creates a new byte buffer with the given initial `size` in bytes.
     ///
@@ -195,7 +220,8 @@ impl ByteBuffer {
             Err(_) if amortized > new_size => Self::alloc_zeroed_vec(new_size)?,
             Err(error) => return Err(error),
         };
-        new_vec[..vec.len()].copy_from_slice(&vec[..]);
+        // Note: `new_vec` is zero-initialized so zero chunks need not be copied.
+        copy_nonzero_chunks(&vec[..], &mut new_vec[..vec.len()]);
         // Frees the old allocation which is still owned by `vec`.
         drop(ManuallyDrop::into_inner(vec));
         let (ptr, _, capacity) = vec_into_raw_parts(new_vec);
@@ -442,5 +468,26 @@ mod test {
         let mut buffer = ByteBuffer::new(4).unwrap();
         buffer.grow(5, None).unwrap();
         assert_eq!(buffer.capacity, 8);
+    }
+
+    #[test]
+    fn grow_beyond_capacity_preserves_sparse_contents() {
+        // Spans several 4 KiB chunks so that zero chunks are skipped while
+        // non-zero chunks, including a partial last chunk, are copied.
+        let mut buffer = ByteBuffer::new(10_000).unwrap();
+        let marks = [0, 4095, 4096, 9_999];
+        for (i, &pos) in marks.iter().enumerate() {
+            buffer.data_mut()[pos] = i as u8 + 1;
+        }
+        buffer.grow(20_000, None).unwrap();
+        assert_eq!(buffer.len(), 20_000);
+        for (i, byte) in buffer.data().iter().enumerate() {
+            let expected = match marks.iter().position(|&pos| pos == i) {
+                Some(n) => n as u8 + 1,
+                None => 0x00_u8,
+            };
+            assert_eq!(*byte, expected, "mismatch at byte {i}");
+        }
+        assert_zeroed_tail(&buffer);
     }
 }
