@@ -251,7 +251,13 @@ impl Memory {
         // 3. There is enough fuel for the operation.
         //
         // Only the actual growing of the underlying byte buffer may now fail.
-        if let Err(error) = self.bytes.grow(desired_byte_size) {
+        //
+        // Note: The maximum size bounds the capacity the byte buffer reserves for future
+        //       growth. It saturates at `usize::MAX` instead of truncating on 32-bit hosts.
+        let max_buffer_size = self
+            .max_size_in_bytes()
+            .map(|max| usize::try_from(max).unwrap_or(usize::MAX));
+        if let Err(error) = self.bytes.grow(desired_byte_size, max_buffer_size) {
             return notify_limiter(limiter, error);
         }
         Ok(current_size)

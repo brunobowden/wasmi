@@ -141,6 +141,9 @@ impl ByteBuffer {
     ///
     /// The newly added bytes will be zero initialized.
     ///
+    /// `max_size` is the maximum size in bytes the byte buffer may ever grow to, if any.
+    /// It bounds the capacity reserved for future growth.
+    ///
     /// # Panics
     ///
     /// - If the current size of the [`ByteBuffer`] is larger than `new_size`.
@@ -150,16 +153,21 @@ impl ByteBuffer {
     /// - If it is not possible to grow the [`ByteBuffer`] to `new_size`.
     ///     - `vec`: If the system allocator ran out of memory to allocate.
     ///     - `static`: If `new_size` is larger than it's the static buffer capacity.
-    pub fn grow(&mut self, new_size: usize) -> Result<(), MemoryError> {
+    pub fn grow(&mut self, new_size: usize, max_size: Option<usize>) -> Result<(), MemoryError> {
         assert!(self.len() <= new_size);
         match self.get_vec() {
-            Some(vec) => self.grow_vec(vec, new_size),
+            Some(vec) => self.grow_vec(vec, new_size, max_size),
             None => self.grow_static(new_size),
         }
     }
 
     /// Grow the byte buffer to the given `new_size` when backed by a [`Vec`].
-    fn grow_vec(&mut self, vec: ManuallyDrop<Vec<u8>>, new_size: usize) -> Result<(), MemoryError> {
+    fn grow_vec(
+        &mut self,
+        vec: ManuallyDrop<Vec<u8>>,
+        new_size: usize,
+        max_size: Option<usize>,
+    ) -> Result<(), MemoryError> {
         debug_assert!(vec.len() <= new_size);
         if new_size <= self.capacity {
             // Invariant: all bytes in `len..capacity` are already zero.
@@ -174,7 +182,13 @@ impl ByteBuffer {
         // Since the new allocation is zero-initialized via `alloc_zeroed` its unused
         // capacity does not cost physical memory for allocations served with fresh
         // pages by the system allocator, unlike `Vec::resize` which writes zeros.
-        let amortized = cmp::max(new_size, self.capacity.saturating_mul(2));
+        // However, it does cost virtual address space which is limited on some
+        // platforms. Therefore the capacity never exceeds the maximum size.
+        let max_capacity = cmp::max(max_size.unwrap_or(usize::MAX), new_size);
+        let amortized = cmp::min(
+            cmp::max(new_size, self.capacity.saturating_mul(2)),
+            max_capacity,
+        );
         let mut new_vec = match Self::alloc_zeroed_vec(amortized) {
             Ok(new_vec) => new_vec,
             // Retry with the exact size before reporting an out of memory error.
@@ -309,7 +323,7 @@ mod test {
     #[test]
     fn test_growing_buffer() {
         let mut buffer = ByteBuffer::new(5).unwrap();
-        buffer.grow(10).unwrap();
+        buffer.grow(10, None).unwrap();
         assert_eq!(buffer.len(), 10);
         assert_eq!(buffer.data(), &[0; 10]);
     }
@@ -321,10 +335,10 @@ mod test {
         let mut buffer = ByteBuffer::new_static(buf, 5).unwrap();
         assert_eq!(buffer.len(), 5);
         assert_eq!(buffer.data(), &[0; 5]);
-        buffer.grow(8).unwrap();
+        buffer.grow(8, None).unwrap();
         assert_eq!(buffer.len(), 8);
         assert_eq!(buffer.data(), &[0; 8]);
-        buffer.grow(10).unwrap();
+        buffer.grow(10, None).unwrap();
         assert_eq!(buffer.len(), 10);
         assert_eq!(buffer.data(), &[0; 10]);
     }
@@ -334,7 +348,7 @@ mod test {
         static mut BUF: [u8; 5] = [7; 5];
         let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
         let mut buffer = ByteBuffer::new_static(buf, 5).unwrap();
-        assert!(buffer.grow(10).is_err());
+        assert!(buffer.grow(10, None).is_err());
     }
 
     #[test]
@@ -345,14 +359,14 @@ mod test {
         ));
         let mut buffer = ByteBuffer::new(0).unwrap();
         assert!(matches!(
-            buffer.grow(usize::MAX).unwrap_err(),
+            buffer.grow(usize::MAX, None).unwrap_err(),
             MemoryError::OutOfSystemMemory
         ));
         assert_eq!(buffer.len(), 0);
         assert_eq!(buffer.data().first(), None);
-        assert!(buffer.grow(1).is_ok());
+        assert!(buffer.grow(1, None).is_ok());
         assert!(matches!(
-            buffer.grow(usize::MAX).unwrap_err(),
+            buffer.grow(usize::MAX, None).unwrap_err(),
             MemoryError::OutOfSystemMemory
         ));
         assert_eq!(buffer.len(), 1);
@@ -362,9 +376,9 @@ mod test {
     #[test]
     fn grow_from_empty() {
         let mut buffer = ByteBuffer::new(0).unwrap();
-        buffer.grow(0).unwrap();
+        buffer.grow(0, None).unwrap();
         assert_eq!(buffer.len(), 0);
-        buffer.grow(1).unwrap();
+        buffer.grow(1, None).unwrap();
         assert_eq!(buffer.data(), &[0x00_u8]);
     }
 
@@ -378,7 +392,7 @@ mod test {
         let mut buffer = ByteBuffer::new(3).unwrap();
         let mut model = alloc::vec![0x00_u8; 3];
         for (step, new_size) in [3, 4, 7, 8, 9, 31, 32, 33, 1000].into_iter().enumerate() {
-            buffer.grow(new_size).unwrap();
+            buffer.grow(new_size, None).unwrap();
             model.resize(new_size, 0x00_u8);
             assert_eq!(
                 buffer.data(),
@@ -400,15 +414,33 @@ mod test {
     fn grow_within_capacity_keeps_allocation() {
         let mut buffer = ByteBuffer::new(4).unwrap();
         // Growing beyond the capacity reallocates with amortized capacity.
-        buffer.grow(5).unwrap();
+        buffer.grow(5, None).unwrap();
         assert_eq!(buffer.capacity, 8);
         assert_zeroed_tail(&buffer);
         buffer.data_mut()[4] = 0xFF;
         let ptr = buffer.ptr;
         // Growing within the capacity neither reallocates nor touches memory.
-        buffer.grow(8).unwrap();
+        buffer.grow(8, None).unwrap();
         assert_eq!(buffer.ptr, ptr);
         assert_eq!(buffer.data(), &[0, 0, 0, 0, 0xFF, 0, 0, 0]);
         assert_zeroed_tail(&buffer);
+    }
+
+    #[test]
+    fn grow_capacity_is_capped_at_max_size() {
+        let mut buffer = ByteBuffer::new(4).unwrap();
+        // Doubling would yield a capacity of 8 but the maximum size is 6.
+        buffer.grow(5, Some(6)).unwrap();
+        assert_eq!(buffer.capacity, 6);
+        assert_zeroed_tail(&buffer);
+        // Growing to the maximum size stays within the capacity.
+        let ptr = buffer.ptr;
+        buffer.grow(6, Some(6)).unwrap();
+        assert_eq!(buffer.ptr, ptr);
+        assert_eq!(buffer.data(), &[0; 6]);
+        // Without a maximum size the capacity is amortized as usual.
+        let mut buffer = ByteBuffer::new(4).unwrap();
+        buffer.grow(5, None).unwrap();
+        assert_eq!(buffer.capacity, 8);
     }
 }
