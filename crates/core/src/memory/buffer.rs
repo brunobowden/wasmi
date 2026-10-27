@@ -1,6 +1,6 @@
 use crate::memory::MemoryError;
 use alloc::{alloc::Layout, slice, vec::Vec};
-use core::mem::ManuallyDrop;
+use core::{cmp, mem::ManuallyDrop};
 
 /// A byte buffer implementation.
 ///
@@ -9,6 +9,18 @@ use core::mem::ManuallyDrop;
 /// This is less efficient than the byte buffer implementation that is
 /// based on actual OS provided virtual memory but it is a safe fallback
 /// solution fitting any platform.
+///
+/// # Invariant
+///
+/// If the [`ByteBuffer`] is backed by a `Vec<u8>` all bytes in `len..capacity` are zero.
+///
+/// - Every allocation is zero-initialized for its whole capacity via `alloc_zeroed`.
+/// - Nothing writes past `len`: slice access is bounded by `len` via [`ByteBuffer::data`]
+///   and [`ByteBuffer::data_mut`], and raw access via `Memory::data_ptr` is bounded by
+///   `Memory::data_size`, which is `len`.
+/// - A [`ByteBuffer`] never shrinks.
+///
+/// This allows growing within the current capacity without touching any memory.
 #[derive(Debug)]
 pub struct ByteBuffer {
     /// The pointer to the underlying byte buffer.
@@ -147,18 +159,35 @@ impl ByteBuffer {
     }
 
     /// Grow the byte buffer to the given `new_size` when backed by a [`Vec`].
-    fn grow_vec(
-        &mut self,
-        mut vec: ManuallyDrop<Vec<u8>>,
-        new_size: usize,
-    ) -> Result<(), MemoryError> {
+    fn grow_vec(&mut self, vec: ManuallyDrop<Vec<u8>>, new_size: usize) -> Result<(), MemoryError> {
         debug_assert!(vec.len() <= new_size);
-        let additional = new_size - vec.len();
-        if vec.try_reserve(additional).is_err() {
-            return Err(MemoryError::OutOfSystemMemory);
+        if new_size <= self.capacity {
+            // Invariant: all bytes in `len..capacity` are already zero.
+            //
+            // Thus growing within the current capacity does not need to write,
+            // and thereby commit, any memory.
+            self.len = new_size;
+            return Ok(());
+        }
+        // Amortize the cost of growing the same way as `Vec` does.
+        //
+        // Since the new allocation is zero-initialized via `alloc_zeroed` its unused
+        // capacity does not cost physical memory for allocations served with fresh
+        // pages by the system allocator, unlike `Vec::resize` which writes zeros.
+        let amortized = cmp::max(new_size, self.capacity.saturating_mul(2));
+        let mut new_vec = match Self::alloc_zeroed_vec(amortized) {
+            Ok(new_vec) => new_vec,
+            // Retry with the exact size before reporting an out of memory error.
+            Err(_) if amortized > new_size => Self::alloc_zeroed_vec(new_size)?,
+            Err(error) => return Err(error),
         };
-        vec.resize(new_size, 0x00_u8);
-        (self.ptr, self.len, self.capacity) = vec_into_raw_parts(ManuallyDrop::into_inner(vec));
+        new_vec[..vec.len()].copy_from_slice(&vec[..]);
+        // Frees the old allocation which is still owned by `vec`.
+        drop(ManuallyDrop::into_inner(vec));
+        let (ptr, _, capacity) = vec_into_raw_parts(new_vec);
+        self.ptr = ptr;
+        self.len = new_size;
+        self.capacity = capacity;
         Ok(())
     }
 
@@ -229,6 +258,20 @@ impl Drop for ByteBuffer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Asserts the [`ByteBuffer`] invariant that all bytes in `len..capacity` are zero.
+    fn assert_zeroed_tail(buffer: &ByteBuffer) {
+        assert!(!buffer.is_static);
+        // Safety: the whole capacity of a `Vec` backed `ByteBuffer` is initialized
+        //         since every allocation is zero-initialized via `alloc_zeroed`.
+        let all = unsafe { slice::from_raw_parts(buffer.ptr, buffer.capacity) };
+        assert!(
+            all[buffer.len..].iter().all(|&byte| byte == 0x00_u8),
+            "bytes in len..capacity must be zero (len = {}, capacity = {})",
+            buffer.len,
+            buffer.capacity,
+        );
+    }
     #[test]
     fn test_basic_allocation_deallocation() {
         let buffer = ByteBuffer::new(10).unwrap();
@@ -342,6 +385,7 @@ mod test {
                 &model[..],
                 "mismatch after growing to {new_size}"
             );
+            assert_zeroed_tail(&buffer);
             // Write the first and last byte so that later growth steps must preserve them.
             let marker = step as u8 + 1;
             buffer.data_mut()[0] = marker;
@@ -350,5 +394,21 @@ mod test {
             model[new_size - 1] = marker;
         }
         assert_eq!(buffer.data(), &model[..]);
+    }
+
+    #[test]
+    fn grow_within_capacity_keeps_allocation() {
+        let mut buffer = ByteBuffer::new(4).unwrap();
+        // Growing beyond the capacity reallocates with amortized capacity.
+        buffer.grow(5).unwrap();
+        assert_eq!(buffer.capacity, 8);
+        assert_zeroed_tail(&buffer);
+        buffer.data_mut()[4] = 0xFF;
+        let ptr = buffer.ptr;
+        // Growing within the capacity neither reallocates nor touches memory.
+        buffer.grow(8).unwrap();
+        assert_eq!(buffer.ptr, ptr);
+        assert_eq!(buffer.data(), &[0, 0, 0, 0, 0xFF, 0, 0, 0]);
+        assert_zeroed_tail(&buffer);
     }
 }
