@@ -114,6 +114,14 @@ What it shows:
 6. **Not yet measurable:** the footprint cost of each pattern by itself, because the cases share a
    process and the cache carries memory from one case to the next.
 
+Second run (build 1019, 10/27/2026 11:03 PM; battery 20%, not a fresh launch, so timings are
+noisy): same shape, different details. A freed 128 MiB block was mostly released within 1 s
+(10 MiB left, vs 109 MiB in the first run). Grown to 256 MiB: `realloc` + zero-fill 237 MiB
+untouched; copy-and-free 236 MiB untouched and 268 MiB written (no saving, but not the macOS 2×);
+wasmi 2.0 220 MiB untouched. About 255 MiB was released between two cases. So iOS keeps freed
+blocks like macOS but releases them sooner and unpredictably; per-case figures from a shared
+process aren't reliable, and the copy approach saves nothing on iOS either.
+
 ## Linux (glibc)
 
 - Freed `mmap`ed blocks are returned immediately, and reading never-written pages maps the shared
