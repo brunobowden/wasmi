@@ -13,7 +13,7 @@ enforces; on Linux, resident memory (`VmRSS`).
 | --- | --- | --- | --- |
 | Freed large blocks returned to the OS | Yes, immediately (`munmap`) | **No**: libmalloc's large cache keeps them in the footprint | **Mostly no**: 109 of 128 MiB still counted 1 s after `free`; some released later |
 | `alloc_zeroed` of a fresh block | Lazy | Lazy | Lazy only when not served from the cache |
-| `alloc_zeroed` served from cached (dirty) blocks | n/a | Commits: `calloc` must clear it | Commits (inferred: a 256 MiB `calloc` took 16–22 ms) |
+| `alloc_zeroed` served from cached (dirty) blocks | n/a | Resident: `calloc` clears it (0.3–0.5 ms per 64 MiB vs 0.0 ms fresh) | Resident (inferred: a 256 MiB `calloc` took 16–22 ms) |
 | Growth via `realloc` + zero-fill (wasmi 2.0, #2064) | Commits every grown page | Commits every grown page | Commits every grown page |
 | Growth via "doubled zeroed block, copy non-zero chunks, free old" | Lazy | **Worse than `realloc`**: 2× footprint when written, no saving when untouched | Not measurable yet (see below); slowest single grow 25–36 ms vs 1–6 ms |
 
@@ -47,6 +47,30 @@ Measured 10/27/2026 on an M4 Max, macOS 27, by growing one buffer 1 page at a ti
 - `malloc_zone_pressure_relief` does not release these blocks (rawtonic PR #381).
 - At 1 GiB: 2,049 MiB with the copy approach vs 1,026 MiB with `realloc`; slowest grow 52–99 ms
   vs under 1.5 ms.
+
+Full matrix (10/27/2026, M4 Max, 128 GiB, macOS 26.6.2; every case in a fresh process, each with
+and without `MallocLargeCache=0`; the Rust runner and plain C agree to within 1 MiB):
+
+| Case, grown 1 page at a time | 256 MiB | 256 MiB, cache off | 1 GiB | 1 GiB, cache off | Slowest grow |
+| --- | --: | --: | --: | --: | --: |
+| `realloc` + zero-fill, untouched | 258 | 256 | 1,027 | 1,025 | ≤ 0.8 ms |
+| `realloc` + zero-fill, written | 258 | 256 | 1,027 | 1,025 | ≤ 0.2 ms |
+| Copy-and-free, untouched | 256 | **0** | 1,025 | **0** | 12–34 ms |
+| Copy-and-free, written | **512** | 256 | **2,049** | 1,025 | 13–47 ms |
+| Single `calloc`, untouched | 0 | 0 | 0 | 0 | |
+| wasmi 2.0 `memory.grow`, untouched | 258 | 256 | 1,027 | 1,025 | ≤ 0.3 ms |
+
+(MiB of `phys_footprint` after growth. With the cache on, freeing the buffer changed nothing; with
+it off, everything returned to 0.)
+
+- **Retention is indefinite on this Mac:** a freed 128 MiB block still counted 128 MiB after 1, 5
+  and 15 s.
+- **No cache limit reached:** 16 freed blocks of every size from 16 to 512 MiB (up to 8 GiB) all
+  stayed counted, consistent with the reported 64 × ≤ 512 MiB limit on ≥ 32 GiB Macs.
+- **Recycled blocks are cleared:** re-creating a 64 MiB `calloc` block took 0.3–0.5 ms per round
+  with the cache vs 0.0 ms without. The footprint didn't grow only because the recycled block was
+  already counted; from the second creation on, an untouched block costs its full size. With wasmi
+  2.0.0 (no #2064), `Memory::new` committed 64 MiB per creation with the cache off.
 
 ## iOS (libmalloc, iPhone 18 Pro Max, iOS 27.2)
 
@@ -104,8 +128,8 @@ What it shows:
 
 - iOS, one case per app launch (or per fresh process on macOS), so cases can't inherit cached
   blocks: each growth pattern, untouched and written, at 256 MiB.
-- iOS and macOS: create, drop and re-create memories of the same size, to measure how often
-  `alloc_zeroed` gets a recycled block and commits it. This matters for #2064 itself.
+- iOS: create, drop and re-create memories of the same size (the MyBench `recycle` test, pending
+  a device run). On macOS, recycled blocks are cleared and stay resident (above).
 - Whether the iOS cache's size limits match macOS's below-32-GiB setting (16 blocks of up to
   128 MiB): the iPhone has 12 GB of RAM.
 - How long iOS keeps retained blocks, and what triggers the release (time, pressure, size).
